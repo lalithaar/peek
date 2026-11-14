@@ -21,11 +21,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # cargo reads CARGO_REGISTRY_TOKEN from the environment, so the token
-      # never appears on the command line.
+      # never appears on the command line. Publishing is skipped when the
+      # version is already on crates.io, so re-running a tag is safe.
       - name: cargo publish
-        run: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if curl -fsS -H 'User-Agent: peek-release' \
+              "https://crates.io/api/v1/crates/peek-editor/$version" >/dev/null; then
+            echo "peek-editor $version is already on crates.io; nothing to publish"
+          else
+            cargo publish
+          fi
 
   binaries:
     name: build (${{ matrix.target }})
@@ -53,13 +62,17 @@ jobs:
       - name: build
         run: cargo build --release --target ${{ matrix.target }}
 
+      # Keep the archive path relative: GNU tar on Git Bash mistakes a
+      # `D:\...` destination for a remote host ("Cannot connect to D:").
       - name: package
         shell: bash
         run: |
           set -euo pipefail
-          cd "target/${{ matrix.target }}/release"
-          if [ -f peek.exe ]; then bin=peek.exe; else bin=peek; fi
-          tar -czf "$GITHUB_WORKSPACE/peek-${{ matrix.target }}.tar.gz" "$bin"
+          out="peek-${{ matrix.target }}.tar.gz"
+          dir="target/${{ matrix.target }}/release"
+          if [ -f "$dir/peek.exe" ]; then bin=peek.exe; else bin=peek; fi
+          tar -czf "$out" -C "$dir" "$bin"
+          echo "created $out"
 
       - uses: actions/upload-artifact@v4
         with:
