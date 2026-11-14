@@ -4,6 +4,7 @@
 
 mod app;
 mod editor;
+mod git;
 mod grep;
 mod index;
 mod query;

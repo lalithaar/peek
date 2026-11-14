@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
@@ -23,7 +23,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let picking = app.focus == Focus::Picker;
     let items = if picking { app.visible_len() } else { 0 };
-    let max_drop = area.height.saturating_sub(4).min(14).max(1);
+    let max_drop = area.height.saturating_sub(4).clamp(1, 14);
     // One row stays reserved for feedback ("searching…", "no files match") as
     // soon as there is something to report; an untouched empty query keeps the
     // screen to the splash and the prompt.
@@ -141,53 +141,55 @@ fn draw_buffer(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
 
 fn draw_splash(frame: &mut Frame, area: Rect) {
     let dim = Style::default().fg(Color::DarkGray);
+    let label = Style::default().fg(Color::Gray);
     let accent = Style::default()
         .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
 
+    // One fixed-width first column, so the descriptions line up as a table
+    // instead of every row being centred on its own.
+    let key_col = 12;
+    let row = |keys: &str, description: &str| {
+        Line::from(vec![
+            Span::styled(format!("  {keys:<key_col$} "), label),
+            Span::styled(description.to_string(), dim),
+        ])
+    };
+
     let lines = vec![
+        // Two leading spaces keep the title flush with the table's first
+        // column instead of hanging off its left edge.
+        Line::from(Span::styled("  peek", accent)),
+        Line::from(Span::styled("  type to find a file", dim)),
         Line::from(""),
-        Line::from(Span::styled("peek", accent)),
+        row("index", "fuzzy path match"),
+        row("\"literal\"", "exact substring"),
+        row("/regex/", "pattern"),
+        row("auth/ tok", "scoped to a directory"),
+        row(":l rehab", "find a line in this file"),
+        row(":f token", "search inside files"),
+        row("!test", "exclude"),
         Line::from(""),
-        Line::from(Span::styled("type to find a file", dim)),
+        row("ctrl+g", "commit this file"),
+        row("ctrl+shift+g", "commit every file edited here"),
+        row("ctrl+u", "push"),
         Line::from(""),
-        Line::from(vec![
-            Span::styled("  index        ", Style::default().fg(Color::Gray)),
-            Span::styled("fuzzy path match", dim),
-        ]),
-        Line::from(vec![
-            Span::styled("  \"literal\"    ", Style::default().fg(Color::Gray)),
-            Span::styled("exact substring", dim),
-        ]),
-        Line::from(vec![
-            Span::styled("  /regex/      ", Style::default().fg(Color::Gray)),
-            Span::styled("pattern", dim),
-        ]),
-        Line::from(vec![
-            Span::styled("  auth/ tok    ", Style::default().fg(Color::Gray)),
-            Span::styled("scoped to a directory", dim),
-        ]),
-        Line::from(vec![
-            Span::styled("  :l rehab     ", Style::default().fg(Color::Gray)),
-            Span::styled("find a line in this file", dim),
-        ]),
-        Line::from(vec![
-            Span::styled("  :f token     ", Style::default().fg(Color::Gray)),
-            Span::styled("search inside files", dim),
-        ]),
-        Line::from(vec![
-            Span::styled("  !test        ", Style::default().fg(Color::Gray)),
-            Span::styled("exclude", dim),
-        ]),
+        row("ctrl+s", "save"),
+        row("esc", "back to the query line"),
+        row("ctrl+q", "quit"),
     ];
 
+    // Centre the block, not the lines: every row keeps a common left edge.
+    let block_width = lines.iter().map(|line| line.width()).max().unwrap_or(0) as u16;
+    let width = block_width.min(area.width);
     let height = (area.height as usize).min(lines.len()) as u16;
     let rect = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
+        width,
         height,
-        ..area
     };
-    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), rect);
+    frame.render_widget(Paragraph::new(lines), rect);
 }
 
 fn draw_results(frame: &mut Frame, app: &App, area: Rect) {
@@ -326,8 +328,8 @@ fn draw_query(frame: &mut Frame, app: &App, area: Rect) -> u16 {
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let hints = match app.focus {
-        Focus::Picker => "enter open · up/down select · esc clear · ctrl+q quit",
-        Focus::Editor => "esc find file · ctrl+s save · ctrl+z undo · alt+← back",
+        Focus::Picker => "enter open · ↑↓ select · esc clear · ctrl+g commit · ctrl+u push",
+        Focus::Editor => "esc find · ctrl+s save · ctrl+g commit · ctrl+shift+g all · ctrl+u push",
     };
 
     let right = if let Some(message) = &app.buffer.message {
@@ -382,7 +384,11 @@ fn snippet_row(head: String, snippet: &str, ranges: &[(u32, u32)], width: usize)
     let room = width.saturating_sub(head.chars().count());
     spans.extend(highlighted(
         snippet,
-        |i| ranges.iter().any(|(start, len)| i >= *start && i < *start + *len),
+        |i| {
+            ranges
+                .iter()
+                .any(|(start, len)| i >= *start && i < *start + *len)
+        },
         Style::default(),
         Style::default()
             .fg(Color::Yellow)
@@ -619,6 +625,37 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let caret = terminal.get_cursor_position().unwrap();
         assert_eq!(symbol_at(&terminal, caret.x, caret.y), "a");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn splash_rows_share_one_left_edge() {
+        let dir = std::env::temp_dir().join(format!("peek-ui-splash-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut app = App::new(dir.clone());
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let width = 90;
+        let row = |y: u16| -> String {
+            (0..width)
+                .map(|x| symbol_at(&terminal, x, y))
+                .collect::<String>()
+        };
+        let column_of = |needle: &str| -> u16 {
+            (0..30u16)
+                .find_map(|y| row(y).find(needle).map(|col| col as u16))
+                .unwrap_or_else(|| panic!("no row containing {needle:?}"))
+        };
+
+        let index = column_of("index");
+        assert_eq!(column_of(":f token"), index, "query rows must align");
+        assert_eq!(column_of("ctrl+shift+g"), index, "key rows must align");
+        assert_eq!(column_of("ctrl+u"), index);
+
+        // The block is centred as a whole, so its left edge is not column 0.
+        assert!(index > 0, "block should sit away from the left edge");
 
         fs::remove_dir_all(&dir).ok();
     }

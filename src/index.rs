@@ -35,10 +35,8 @@ pub fn spawn_walk(root: PathBuf) -> Receiver<WalkMsg> {
                 continue;
             };
             batch.push(rel.to_string_lossy().replace('\\', "/"));
-            if batch.len() >= 2048 {
-                if tx.send(WalkMsg::Batch(std::mem::take(&mut batch))).is_err() {
-                    return;
-                }
+            if batch.len() >= 2048 && tx.send(WalkMsg::Batch(std::mem::take(&mut batch))).is_err() {
+                return;
             }
         }
         if !batch.is_empty() {

@@ -451,7 +451,11 @@ mod tests {
         b.insert_str("  one\n\ttwo\nthree");
         assert_eq!(
             b.lines,
-            vec!["  one".to_string(), "\ttwo".to_string(), "three".to_string()]
+            vec![
+                "  one".to_string(),
+                "\ttwo".to_string(),
+                "three".to_string()
+            ]
         );
         assert_eq!(b.row, 2);
         assert_eq!(b.col, 5);
@@ -487,7 +491,10 @@ mod tests {
         let mut b = Buffer::new();
         b.open(&path).unwrap();
         assert!(b.crlf);
-        assert_eq!(b.lines, vec!["a".to_string(), "b".to_string(), String::new()]);
+        assert_eq!(
+            b.lines,
+            vec!["a".to_string(), "b".to_string(), String::new()]
+        );
         b.insert_str("x");
         assert!(b.save().unwrap());
         assert!(!b.dirty);
@@ -508,7 +515,12 @@ mod tests {
 
         assert!(!b.save().unwrap());
         assert!(b.dirty);
-        assert!(b.message.as_deref().unwrap_or("").contains("changed on disk"));
+        assert!(
+            b.message
+                .as_deref()
+                .unwrap_or("")
+                .contains("changed on disk")
+        );
 
         assert!(b.save().unwrap());
         assert_eq!(fs::read_to_string(&path).unwrap(), "mine original\n");

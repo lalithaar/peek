@@ -80,7 +80,7 @@ impl Highlighter {
 
             let mut segments: Vec<Segment> = Vec::new();
             for (style, piece) in ranges {
-                let piece = piece.trim_end_matches(|c| c == '\n' || c == '\r');
+                let piece = piece.trim_end_matches(['\n', '\r']);
                 if piece.is_empty() {
                     continue;
                 }
@@ -115,28 +115,60 @@ fn ansi_for(style: SynStyle) -> Color {
     let bright = lightness > 0.70;
     match hue {
         h if !(20.0..340.0).contains(&h) => {
-            if bright { Color::LightRed } else { Color::Red }
+            if bright {
+                Color::LightRed
+            } else {
+                Color::Red
+            }
         }
         h if h < 45.0 => {
-            if bright { Color::LightYellow } else { Color::Red }
+            if bright {
+                Color::LightYellow
+            } else {
+                Color::Red
+            }
         }
         h if h < 70.0 => {
-            if bright { Color::LightYellow } else { Color::Yellow }
+            if bright {
+                Color::LightYellow
+            } else {
+                Color::Yellow
+            }
         }
         h if h < 165.0 => {
-            if bright { Color::LightGreen } else { Color::Green }
+            if bright {
+                Color::LightGreen
+            } else {
+                Color::Green
+            }
         }
         h if h < 195.0 => {
-            if bright { Color::LightCyan } else { Color::Cyan }
+            if bright {
+                Color::LightCyan
+            } else {
+                Color::Cyan
+            }
         }
         h if h < 262.0 => {
-            if bright { Color::LightBlue } else { Color::Blue }
+            if bright {
+                Color::LightBlue
+            } else {
+                Color::Blue
+            }
         }
         h if h < 320.0 => {
-            if bright { Color::LightMagenta } else { Color::Magenta }
+            if bright {
+                Color::LightMagenta
+            } else {
+                Color::Magenta
+            }
         }
         _ => {
-            if bright { Color::LightRed } else { Color::Red }
+            if bright {
+                Color::LightRed
+            } else {
+                Color::Red
+            }
         }
     }
 }
@@ -166,7 +198,11 @@ fn hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
         60.0 * ((r - g) / delta + 4.0)
     };
 
-    (if hue < 0.0 { hue + 360.0 } else { hue }, saturation, lightness)
+    (
+        if hue < 0.0 { hue + 360.0 } else { hue },
+        saturation,
+        lightness,
+    )
 }
 
 #[cfg(test)]
@@ -228,7 +264,11 @@ mod tests {
     fn oversized_files_are_not_highlighted() {
         let highlighter = Highlighter::new();
         let lines = vec!["x".to_string(); MAX_LINES + 1];
-        assert!(highlighter.highlight(Some(&PathBuf::from("big.rs")), &lines).is_empty());
+        assert!(
+            highlighter
+                .highlight(Some(&PathBuf::from("big.rs")), &lines)
+                .is_empty()
+        );
     }
 
     #[test]

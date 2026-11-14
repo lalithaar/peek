@@ -1,9 +1,19 @@
 [package]
-name = "peek"
+name = "peek-editor"
 version = "0.1.0"
 edition = "2024"
-description = "A terminal editor where you type a pattern, not a path"
+description = "Terminal based text-editor for 'I know roughly what I'm looking for, just take me there' - quickly find, edit, save and move on. 0 modes or tabs to learn."
+license = "MIT"
+repository = "https://github.com/lalithaar/peek"
+readme = "README.md"
+keywords = ["editor", "tui", "terminal", "fuzzy-search", "git"]
+categories = ["command-line-utilities", "text-editors"]
+# Repo-only tooling, not part of the published crate. The screenshots stay in
+# because the README links to them.
+exclude = [".github/", "install-path.ps1"]
 
+# `peek` is taken on crates.io, so the crate is peek-editor. What you install
+# and run is still `peek`.
 [[bin]]
 name = "peek"
 path = "src/main.rs"

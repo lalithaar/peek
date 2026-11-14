@@ -960,7 +960,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "peek"
+name = "peek-editor"
 version = "0.1.0"
 dependencies = [
  "ignore",

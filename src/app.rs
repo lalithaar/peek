@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::editor::Buffer;
+use crate::git::{self, Op as GitOp};
 use crate::grep::{self, ContentHit, ContentResult, LineQuery, Spec};
 use crate::index::{self, FileFilter, Hit, WalkMsg};
 use crate::query::{Mode, Query};
@@ -56,12 +57,22 @@ pub struct App {
     pub highlight: Vec<Vec<Segment>>,
     highlighter: Highlighter,
     highlighted_rev: u64,
+
+    /// Files edited during this session, so "commit all" means what you
+    /// actually touched here.
+    pub edited: Vec<PathBuf>,
+    git_tx: Sender<git::Outcome>,
+    git_rx: Receiver<git::Outcome>,
+    pub git_busy: Option<GitOp>,
     pub mru: Vec<String>,
     history: Vec<PathBuf>,
     hist_pos: usize,
 
     pub quit: bool,
     quit_armed: bool,
+    /// Set when a switch would throw away unsaved edits; a second pick of the
+    /// same file within a few seconds confirms the discard.
+    pending_open: Option<(PathBuf, Instant)>,
     pub status: String,
 }
 
@@ -69,6 +80,7 @@ impl App {
     pub fn new(root: PathBuf) -> Self {
         let walk_rx = index::spawn_walk(root.clone());
         let (content_tx, content_rx) = channel();
+        let (git_tx, git_rx) = channel();
         let mut app = App {
             root,
             files: Vec::new(),
@@ -92,11 +104,16 @@ impl App {
             highlight: Vec::new(),
             highlighter: Highlighter::new(),
             highlighted_rev: u64::MAX,
+            edited: Vec::new(),
+            git_tx,
+            git_rx,
+            git_busy: None,
             mru: Vec::new(),
             history: Vec::new(),
             hist_pos: 0,
             quit: false,
             quit_armed: false,
+            pending_open: None,
             status: String::new(),
         };
         app.recompute();
@@ -128,6 +145,29 @@ impl App {
             self.highlight = self
                 .highlighter
                 .highlight(self.buffer.path.as_deref(), &self.buffer.lines);
+            // Remember what this session actually touched.
+            if self.buffer.dirty
+                && let Some(path) = self.buffer.path.clone()
+                && !self.edited.contains(&path)
+            {
+                self.edited.push(path);
+            }
+        }
+
+        for outcome in self.git_rx.try_iter() {
+            self.git_busy = None;
+            self.status = outcome.message;
+            if outcome.ok {
+                match outcome.op {
+                    GitOp::CommitCurrent => {
+                        if let Some(path) = &self.buffer.path {
+                            self.edited.retain(|edited| edited != path);
+                        }
+                    }
+                    GitOp::CommitAll => self.edited.clear(),
+                    GitOp::Push => {}
+                }
+            }
         }
 
         let mut changed = false;
@@ -351,8 +391,12 @@ impl App {
     // ---- opening files ----------------------------------------------------
 
     fn load(&mut self, path: &Path, line: Option<usize>) -> bool {
+        if !self.confirm_switch(path) {
+            return false;
+        }
         match self.buffer.open(path) {
             Ok(()) => {
+                self.pending_open = None;
                 if let Some(line) = line {
                     self.buffer.goto_line(line.saturating_sub(1));
                 }
@@ -363,6 +407,30 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Opening a file replaces the buffer, so a dirty one gets one warning
+    /// first. Picking the same file again inside a few seconds means yes,
+    /// discard; ctrl+s instead saves and then the switch goes through.
+    fn confirm_switch(&mut self, path: &Path) -> bool {
+        if !self.buffer.dirty {
+            return true;
+        }
+        let confirming = matches!(
+            &self.pending_open,
+            Some((pending, at)) if pending == path && at.elapsed() < Duration::from_secs(5)
+        );
+        if confirming {
+            self.pending_open = None;
+            return true;
+        }
+
+        let name = self.buffer.label();
+        self.pending_open = Some((path.to_path_buf(), Instant::now()));
+        self.status = format!(
+            "{name} has unsaved changes — pick it again to discard them, or ctrl+s to save"
+        );
+        false
     }
 
     fn open_selected(&mut self) {
@@ -425,11 +493,94 @@ impl App {
         if next < 0 || next >= self.history.len() as isize {
             return;
         }
-        self.hist_pos = next as usize;
-        let path = self.history[self.hist_pos].clone();
+        let path = self.history[next as usize].clone();
+        // Only move the history cursor once the file actually opened, so a
+        // refused switch (unsaved changes) leaves the position alone.
         if self.load(&path, None) {
+            self.hist_pos = next as usize;
             self.focus = Focus::Editor;
         }
+    }
+
+    // ---- git --------------------------------------------------------------
+
+    /// `ctrl+g` commits the open file; `ctrl+shift+g` commits everything edited
+    /// in this session. Either way the buffer is written to disk first, because
+    /// git sees files, not buffers.
+    fn git_commit(&mut self, all: bool) {
+        let op = if all {
+            GitOp::CommitAll
+        } else {
+            GitOp::CommitCurrent
+        };
+        if self.git_busy.is_some() {
+            self.status = "git: still working on the last one…".into();
+            return;
+        }
+
+        if self.buffer.dirty {
+            match self.buffer.save() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.status = "git: save the file first (it changed on disk)".into();
+                    return;
+                }
+                Err(err) => {
+                    self.status = format!("git: save failed: {err}");
+                    return;
+                }
+            }
+        }
+
+        let paths: Vec<PathBuf> = if all {
+            self.edited
+                .iter()
+                .filter(|path| path.exists())
+                .cloned()
+                .collect()
+        } else {
+            match &self.buffer.path {
+                Some(path) if path.exists() => vec![path.clone()],
+                _ => Vec::new(),
+            }
+        };
+
+        if paths.is_empty() {
+            self.status = if all {
+                "git: nothing edited in this session yet".into()
+            } else {
+                "git: no file open".into()
+            };
+            return;
+        }
+
+        self.buffer.message = None;
+        self.status = if all {
+            format!(
+                "git: committing {} file(s) edited this session…",
+                paths.len()
+            )
+        } else {
+            "git: committing this file…".into()
+        };
+        self.git_busy = Some(op);
+        git::spawn(self.root.clone(), op, paths, self.git_tx.clone());
+    }
+
+    fn git_push(&mut self) {
+        if self.git_busy.is_some() {
+            self.status = "git: still working on the last one…".into();
+            return;
+        }
+        self.buffer.message = None;
+        self.status = "git: pushing…".into();
+        self.git_busy = Some(GitOp::Push);
+        git::spawn(
+            self.root.clone(),
+            GitOp::Push,
+            Vec::new(),
+            self.git_tx.clone(),
+        );
     }
 
     fn focus_picker(&mut self) {
@@ -458,6 +609,18 @@ impl App {
                 self.buffer.message = Some(format!("save failed: {err}"));
             }
             self.quit_armed = false;
+            return;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'g')) {
+            // Some terminals cannot distinguish ctrl+shift+g from ctrl+g and
+            // deliver an uppercase G instead; accept that as "all" too.
+            let all = key.modifiers.contains(KeyModifiers::SHIFT)
+                || matches!(key.code, KeyCode::Char('G'));
+            self.git_commit(all);
+            return;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('u')) {
+            self.git_push();
             return;
         }
         self.quit_armed = false;
@@ -563,7 +726,7 @@ impl App {
         }
     }
 
-        pub fn on_paste(&mut self, text: String) {
+    pub fn on_paste(&mut self, text: String) {
         match self.focus {
             Focus::Picker => {
                 let flat: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
@@ -627,6 +790,127 @@ mod tests {
     }
 
     #[test]
+    fn switching_files_warns_before_discarding_edits() {
+        let dir = std::env::temp_dir().join(format!("peek-app-switch-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+
+        let mut app = App::new(dir.clone());
+        wait_for_index(&mut app);
+        app.pump();
+
+        assert!(app.load(&a, None));
+        app.buffer.insert_str("precious ");
+        assert!(app.buffer.dirty);
+
+        assert!(!app.load(&b, None), "the first switch must refuse");
+        assert_eq!(app.buffer.path.as_deref(), Some(a.as_path()));
+        assert!(app.buffer.lines[0].starts_with("precious "));
+        assert!(
+            app.status.contains("unsaved changes"),
+            "status was {:?}",
+            app.status
+        );
+
+        assert!(app.load(&b, None), "picking it again confirms");
+        assert_eq!(app.buffer.path.as_deref(), Some(b.as_path()));
+        assert!(!app.buffer.dirty);
+        assert_eq!(app.buffer.lines[0], "b");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn saving_first_lets_the_switch_through() {
+        let dir = std::env::temp_dir().join(format!("peek-app-save-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+
+        let mut app = App::new(dir.clone());
+        wait_for_index(&mut app);
+        app.pump();
+
+        assert!(app.load(&a, None));
+        app.buffer.insert_str("saved ");
+        assert!(app.buffer.save().unwrap());
+
+        assert!(app.load(&b, None), "a clean buffer switches freely");
+        assert_eq!(app.buffer.path.as_deref(), Some(b.as_path()));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_refused_switch_does_not_move_the_history_cursor() {
+        let dir = std::env::temp_dir().join(format!("peek-app-hist-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+
+        let mut app = App::new(dir.clone());
+        wait_for_index(&mut app);
+        app.pump();
+
+        assert!(app.load(&a, None));
+        app.history.push(a.clone());
+        assert!(app.load(&b, None));
+        app.history.push(b.clone());
+        app.hist_pos = 1;
+
+        app.buffer.insert_str("edited ");
+        app.go_history(-1);
+
+        assert_eq!(app.buffer.path.as_deref(), Some(b.as_path()));
+        assert_eq!(app.hist_pos, 1, "a refused step must not move the cursor");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tracks_every_file_edited_in_the_session() {
+        let dir = std::env::temp_dir().join(format!("peek-app-edited-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        let b = dir.join("b.txt");
+        fs::write(&a, "a\n").unwrap();
+        fs::write(&b, "b\n").unwrap();
+
+        let mut app = App::new(dir.clone());
+        wait_for_index(&mut app);
+        app.pump();
+        assert!(app.edited.is_empty(), "opening a file is not editing it");
+
+        app.load(&a, None);
+        app.buffer.insert_str("edited ");
+        app.pump();
+        assert_eq!(app.edited, vec![a.clone()]);
+
+        // Switching away from a dirty buffer needs the second pick to confirm.
+        assert!(!app.load(&b, None));
+        assert!(app.load(&b, None));
+        app.buffer.insert_str("also edited ");
+        app.pump();
+        assert_eq!(app.edited, vec![a.clone(), b.clone()]);
+
+        // Editing the same file again must not duplicate it.
+        assert!(!app.load(&a, None));
+        assert!(app.load(&a, None));
+        app.buffer.insert_str("more ");
+        app.pump();
+        assert_eq!(app.edited.len(), 2);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn buffer_search_jumps_to_the_matching_line() {
         let dir = std::env::temp_dir().join(format!("peek-app-line-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
@@ -660,7 +944,10 @@ mod tests {
         assert_eq!(app.focus, Focus::Editor);
         assert_eq!(app.buffer.row, 2);
         assert_eq!(app.buffer.col, 0);
-        assert_eq!(app.buffer.path.as_deref(), Some(dir.join("notes.md").as_path()));
+        assert_eq!(
+            app.buffer.path.as_deref(),
+            Some(dir.join("notes.md").as_path())
+        );
         assert!(app.buffer.lines[0].starts_with("edited "), "edit survived");
         assert!(app.query_input.is_empty());
 
@@ -675,7 +962,12 @@ mod tests {
         app.query_input = ":l rehab".into();
         app.recompute();
         assert!(app.line_hits.is_empty());
-        assert!(app.line_msg.as_deref().unwrap_or("").contains("no file open"));
+        assert!(
+            app.line_msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("no file open")
+        );
         fs::remove_dir_all(&dir).ok();
     }
 
