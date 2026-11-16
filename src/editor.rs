@@ -6,9 +6,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use crate::wrap::{self, TAB_WIDTH};
+
 const UNDO_LIMIT: usize = 300;
 const COALESCE: Duration = Duration::from_millis(400);
-const TAB_WIDTH: usize = 4;
 
 #[derive(Clone)]
 struct Snapshot {
@@ -22,8 +23,12 @@ pub struct Buffer {
     pub lines: Vec<String>,
     pub row: usize,
     pub col: usize,
+    /// Top of the view: which line, and which wrapped row of that line.
     pub scroll: usize,
-    pub hscroll: usize,
+    pub scroll_seg: usize,
+    /// Cells available for text, set by the renderer each frame. Zero means the
+    /// width is not known yet, so lines are not wrapped.
+    pub wrap_width: usize,
     pub dirty: bool,
     /// Bumped on every change to the text, so the highlighter knows when its
     /// cache is stale without diffing lines.
@@ -51,7 +56,8 @@ impl Buffer {
             row: 0,
             col: 0,
             scroll: 0,
-            hscroll: 0,
+            scroll_seg: 0,
+            wrap_width: 0,
             dirty: false,
             revision: 0,
             message: None,
@@ -78,7 +84,7 @@ impl Buffer {
         self.row = 0;
         self.col = 0;
         self.scroll = 0;
-        self.hscroll = 0;
+        self.scroll_seg = 0;
         self.dirty = false;
         self.undo.clear();
         self.redo.clear();
@@ -172,18 +178,59 @@ impl Buffer {
         }
     }
 
+    /// Up and down move by what you can see: a wrapped line is several rows, so
+    /// the caret walks them one at a time, keeping its distance from the left
+    /// edge of the text.
     pub fn move_up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            self.clamp();
+        let Some((row, seg, offset)) = self.visual_cursor() else {
+            if self.row > 0 {
+                self.row -= 1;
+                self.clamp();
+            }
+            return;
+        };
+        if seg > 0 {
+            let rows = wrap::segments(&self.lines[row], self.wrap_width);
+            let target = rows[seg - 1].clone();
+            self.col = wrap::col_at_offset(&self.lines[row], target.start, offset).min(target.end);
+        } else if row > 0 {
+            self.row = row - 1;
+            let rows = wrap::segments(&self.lines[self.row], self.wrap_width);
+            let target = rows.last().cloned().unwrap_or(0..0);
+            self.col =
+                wrap::col_at_offset(&self.lines[self.row], target.start, offset).min(target.end);
         }
     }
 
     pub fn move_down(&mut self) {
-        if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.clamp();
+        let Some((row, seg, offset)) = self.visual_cursor() else {
+            if self.row + 1 < self.lines.len() {
+                self.row += 1;
+                self.clamp();
+            }
+            return;
+        };
+        let rows = wrap::segments(&self.lines[row], self.wrap_width);
+        if seg + 1 < rows.len() {
+            let target = rows[seg + 1].clone();
+            self.col = wrap::col_at_offset(&self.lines[row], target.start, offset).min(target.end);
+        } else if row + 1 < self.lines.len() {
+            self.row = row + 1;
+            self.col = wrap::col_at_offset(&self.lines[self.row], 0, offset);
         }
+    }
+
+    /// The caret as (line, wrapped row of that line, cells from the row's left
+    /// edge), or `None` when lines are not wrapped.
+    fn visual_cursor(&self) -> Option<(usize, usize, usize)> {
+        if self.wrap_width == 0 {
+            return None;
+        }
+        let row = self.row.min(self.lines.len().saturating_sub(1));
+        let rows = wrap::segments(&self.lines[row], self.wrap_width);
+        let seg = wrap::segment_of(&rows, self.col);
+        let offset = wrap::col_in_row(&self.lines[row], rows[seg].start, self.col);
+        Some((row, seg, offset))
     }
 
     pub fn home(&mut self) {
@@ -469,6 +516,37 @@ mod tests {
         b.backspace();
         assert_eq!(b.lines, vec!["abcd".to_string()]);
         assert_eq!(b.col, 2);
+    }
+
+    #[test]
+    fn down_and_up_walk_wrapped_rows() {
+        let mut b = Buffer::new();
+        b.insert_str("aaaa bbbb cccc dddd");
+        b.wrap_width = 10;
+        b.home();
+        b.move_down();
+        assert_eq!(b.row, 0, "a wrapped row is still the same line");
+        assert_eq!(b.col, 10);
+        b.move_down();
+        assert_eq!((b.row, b.col), (0, 10), "nothing below the last row");
+        b.move_up();
+        assert_eq!((b.row, b.col), (0, 0));
+    }
+
+    #[test]
+    fn vertical_movement_keeps_the_screen_column() {
+        let mut b = Buffer::new();
+        b.insert_str("0123456789abcdef\nxyz");
+        b.wrap_width = 8;
+        b.row = 0;
+        b.col = 3;
+
+        b.move_down();
+        assert_eq!((b.row, b.col), (0, 11));
+        b.move_down();
+        assert_eq!((b.row, b.col), (1, 3), "short line clamps to its end");
+        b.move_up();
+        assert_eq!((b.row, b.col), (0, 11));
     }
 
     #[test]

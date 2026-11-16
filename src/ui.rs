@@ -12,8 +12,7 @@ use ratatui::widgets::{Clear, Paragraph};
 use crate::app::{App, Focus};
 use crate::query::Mode;
 use crate::syntax::Segment;
-
-const TAB_WIDTH: usize = 4;
+use crate::wrap::{self, TAB_WIDTH};
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -74,67 +73,103 @@ fn draw_buffer(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
 
     let total = app.buffer.lines.len();
     let num_w = total.to_string().len().max(3);
-    // Exactly as wide as `format!("{:>num_w$} ")` below: digits plus one space.
-    // The cursor is placed at `area.x + gutter + column`, so any slack here
-    // shows up as the caret sitting one cell off the text.
-    let gutter = (num_w + 1) as u16;
+    // Digits, a space, then the rule that separates them from the text.
+    let gutter = (num_w + 2) as u16;
     let text_w = area.width.saturating_sub(gutter) as usize;
     let height = area.height as usize;
     if text_w == 0 || height == 0 {
         return None;
     }
+    // Lines wrap to the width we actually have; movement needs the same number.
+    app.buffer.wrap_width = text_w;
 
-    if app.buffer.row < app.buffer.scroll {
-        app.buffer.scroll = app.buffer.row;
-    }
-    if app.buffer.row >= app.buffer.scroll + height {
-        app.buffer.scroll = app.buffer.row + 1 - height;
-    }
+    let cursor_row = app.buffer.row.min(total - 1);
+    let cursor_rows = wrap::segments(&app.buffer.lines[cursor_row], text_w);
+    let cursor_seg = wrap::segment_of(&cursor_rows, app.buffer.col);
+    let cursor_offset = wrap::col_in_row(
+        &app.buffer.lines[cursor_row],
+        cursor_rows[cursor_seg].start,
+        app.buffer.col,
+    );
 
-    let cursor_col = display_col(&app.buffer.lines[app.buffer.row], app.buffer.col);
-    if cursor_col < app.buffer.hscroll {
-        app.buffer.hscroll = cursor_col;
+    // Keep the view's top row at or above the caret. A jump far down is
+    // snapped so the counting below never walks the whole file.
+    if app.buffer.scroll >= total {
+        app.buffer.scroll = total - 1;
+        app.buffer.scroll_seg = 0;
     }
-    if cursor_col >= app.buffer.hscroll + text_w {
-        app.buffer.hscroll = cursor_col + 1 - text_w;
+    if cursor_row < app.buffer.scroll {
+        app.buffer.scroll = cursor_row;
+        app.buffer.scroll_seg = 0;
+    }
+    if cursor_row.saturating_sub(app.buffer.scroll) > height {
+        app.buffer.scroll = cursor_row;
+        app.buffer.scroll_seg = cursor_seg.saturating_sub(height - 1);
+    }
+    if cursor_row == app.buffer.scroll && cursor_seg < app.buffer.scroll_seg {
+        app.buffer.scroll_seg = cursor_seg;
     }
 
     let mut out: Vec<Line> = Vec::new();
-    for offset in 0..height {
-        let idx = app.buffer.scroll + offset;
-        if idx >= total {
-            break;
-        }
-        let current = idx == app.buffer.row;
-        let number_style = if current {
-            Style::default().fg(Color::Gray)
+    let mut caret: Option<Position> = None;
+    let mut idx = app.buffer.scroll;
+
+    while idx < total && out.len() < height {
+        let rows = wrap::segments(&app.buffer.lines[idx], text_w);
+        // The first visible row of the line may not be its first row.
+        let first = if idx == app.buffer.scroll {
+            app.buffer.scroll_seg.min(rows.len() - 1)
         } else {
-            Style::default().fg(Color::DarkGray)
+            0
         };
-        let number = format!("{:>num_w$} ", idx + 1);
-        let mut spans = vec![Span::styled(number, number_style)];
-        match app.highlight.get(idx) {
-            Some(segments) if !segments.is_empty() => {
-                spans.extend(segment_spans(segments, app.buffer.hscroll, text_w));
+        let current = idx == cursor_row;
+
+        for (seg, row) in rows.iter().enumerate().skip(first) {
+            if out.len() >= height {
+                break;
             }
-            _ => {
-                let visible: String = expand_tabs(&app.buffer.lines[idx])
-                    .chars()
-                    .skip(app.buffer.hscroll)
-                    .take(text_w)
-                    .collect();
-                spans.push(Span::raw(visible));
+            let mut spans = Vec::new();
+            if seg == 0 {
+                let current_style = if current {
+                    Style::default().fg(Color::Gray)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                spans.push(Span::styled(format!("{:>num_w$} ", idx + 1), current_style));
+            } else {
+                // Continuation rows keep the text column, so wrapped code lines
+                // up instead of sliding under the line numbers.
+                spans.push(Span::raw(" ".repeat(num_w + 1)));
+            }
+            // The rule runs down every row, wrapped ones included, so the text
+            // has one clear edge.
+            spans.push(Span::styled(
+                "\u{2502}",
+                Style::default().fg(Color::DarkGray),
+            ));
+
+            match app.highlight.get(idx) {
+                Some(segments) if !segments.is_empty() => {
+                    spans.extend(segment_spans(segments, row.start, row.end));
+                }
+                _ => spans.push(Span::raw(wrap::expand_range(&app.buffer.lines[idx], row))),
+            }
+
+            out.push(Line::from(spans));
+            if current && seg == cursor_seg {
+                caret = Some(Position::new(
+                    area.x + gutter + cursor_offset as u16,
+                    area.y + out.len() as u16 - 1,
+                ));
             }
         }
-        out.push(Line::from(spans));
+        idx += 1;
     }
 
     frame.render_widget(Paragraph::new(out), area);
 
     if app.focus == Focus::Editor {
-        let x = area.x + gutter + (cursor_col.saturating_sub(app.buffer.hscroll)) as u16;
-        let y = area.y + (app.buffer.row - app.buffer.scroll) as u16;
-        return Some(Position::new(x, y));
+        return caret;
     }
     None
 }
@@ -429,32 +464,34 @@ fn highlighted(
     spans
 }
 
-/// Render styled segments through the same column arithmetic as the caret:
-/// tabs expand to the next multiple of `TAB_WIDTH`, and only the visible
-/// window is emitted.
-fn segment_spans(segments: &[Segment], hscroll: usize, width: usize) -> Vec<Span<'static>> {
-    let end = hscroll.saturating_add(width);
+/// Render the chars `[start, end)` of one line's styled segments. Tabs expand
+/// from the row's left edge, matching the caret arithmetic in `wrap`.
+fn segment_spans(segments: &[Segment], start: usize, end: usize) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut index = 0usize;
     let mut column = 0usize;
 
     for segment in segments {
+        let base = index;
+        let count = segment.text.chars().count();
+        index += count;
         let mut buffer = String::new();
-        for ch in segment.text.chars() {
-            let step = if ch == '\t' {
-                TAB_WIDTH - (column % TAB_WIDTH)
-            } else {
-                1
-            };
-            if column >= hscroll && column < end {
-                if ch == '\t' {
-                    buffer.push_str(&" ".repeat(step));
-                } else {
-                    buffer.push(ch);
-                }
+
+        for (offset, ch) in segment.text.chars().enumerate() {
+            let here = base + offset;
+            if here < start {
+                continue;
             }
-            column += step;
-            if column >= end {
+            if here >= end {
                 break;
+            }
+            if ch == '\t' {
+                let step = TAB_WIDTH - (column % TAB_WIDTH);
+                buffer.push_str(&" ".repeat(step));
+                column += step;
+            } else {
+                buffer.push(ch);
+                column += 1;
             }
         }
 
@@ -468,46 +505,9 @@ fn segment_spans(segments: &[Segment], hscroll: usize, width: usize) -> Vec<Span
             }
             spans.push(Span::styled(buffer, style));
         }
-        if column >= end {
-            break;
-        }
     }
 
     spans
-}
-
-fn expand_tabs(line: &str) -> String {
-    if !line.contains('\t') {
-        return line.to_string();
-    }
-    let mut out = String::with_capacity(line.len());
-    let mut col = 0;
-    for ch in line.chars() {
-        if ch == '\t' {
-            let fill = TAB_WIDTH - (col % TAB_WIDTH);
-            out.push_str(&" ".repeat(fill));
-            col += fill;
-        } else {
-            out.push(ch);
-            col += 1;
-        }
-    }
-    out
-}
-
-fn display_col(line: &str, char_col: usize) -> usize {
-    let mut col = 0;
-    for (idx, ch) in line.chars().enumerate() {
-        if idx >= char_col {
-            break;
-        }
-        if ch == '\t' {
-            col += TAB_WIDTH - (col % TAB_WIDTH);
-        } else {
-            col += 1;
-        }
-    }
-    col
 }
 
 #[cfg(test)]
@@ -661,6 +661,41 @@ mod tests {
     }
 
     #[test]
+    fn long_lines_wrap_and_the_caret_follows() {
+        let line = "the quick brown fox jumps over the lazy dog";
+        let (mut app, dir) = app_with_file("wrap", &format!("{line}\n"));
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let row = |y: u16| -> String {
+            (0..20)
+                .map(|x| symbol_at(&terminal, x, y))
+                .collect::<String>()
+        };
+        assert!(row(0).contains("the quick"), "row 0 was {:?}", row(0));
+        assert!(
+            row(1).contains("brown fox"),
+            "the rest of the line should be below it: {:?}",
+            row(1)
+        );
+        // Continuation rows keep the text column and carry no line number, but
+        // the gutter rule still runs down them.
+        assert_eq!(symbol_at(&terminal, 0, 1), " ");
+        assert_eq!(symbol_at(&terminal, 3, 1), " ");
+        assert_eq!(symbol_at(&terminal, 4, 0), "\u{2502}");
+        assert_eq!(symbol_at(&terminal, 4, 1), "\u{2502}");
+
+        // Column 10 is the 'b' of "brown", the first character on row 1.
+        app.buffer.col = 10;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let caret = terminal.get_cursor_position().unwrap();
+        assert_eq!(caret.y, 1, "caret should be on the wrapped row");
+        assert_eq!(symbol_at(&terminal, caret.x, caret.y), "b");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn line_numbers_are_right_aligned_and_text_starts_after_them() {
         let (mut app, dir) = app_with_file("numbers", "one\ntwo\n");
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -668,7 +703,8 @@ mod tests {
 
         let numbers: String = (0..4).map(|x| symbol_at(&terminal, x, 0)).collect();
         assert_eq!(numbers, "  1 ");
-        assert_eq!(symbol_at(&terminal, 4, 0), "o");
+        assert_eq!(symbol_at(&terminal, 4, 0), "\u{2502}", "gutter rule");
+        assert_eq!(symbol_at(&terminal, 5, 0), "o");
 
         fs::remove_dir_all(&dir).ok();
     }

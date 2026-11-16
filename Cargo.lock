@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "peek-editor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ignore",
  "nucleo-matcher",

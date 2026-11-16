@@ -10,6 +10,7 @@ mod index;
 mod query;
 mod syntax;
 mod ui;
+mod wrap;
 
 use std::io::Write;
 use std::path::PathBuf;
