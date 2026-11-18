@@ -92,8 +92,9 @@ fn draw_buffer(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         app.buffer.col,
     );
 
-    // Keep the view's top row at or above the caret. A jump far down is
-    // snapped so the counting below never walks the whole file.
+    // Keep the caret inside the view. The view is measured in rows, and a
+    // wrapped line is several of them, so count the rows that are actually on
+    // screen instead of assuming one per line.
     if app.buffer.scroll >= total {
         app.buffer.scroll = total - 1;
         app.buffer.scroll_seg = 0;
@@ -102,12 +103,47 @@ fn draw_buffer(frame: &mut Frame, app: &mut App, area: Rect) -> Option<Position>
         app.buffer.scroll = cursor_row;
         app.buffer.scroll_seg = 0;
     }
-    if cursor_row.saturating_sub(app.buffer.scroll) > height {
-        app.buffer.scroll = cursor_row;
-        app.buffer.scroll_seg = cursor_seg.saturating_sub(height - 1);
-    }
     if cursor_row == app.buffer.scroll && cursor_seg < app.buffer.scroll_seg {
         app.buffer.scroll_seg = cursor_seg;
+    }
+    // Counting stops as soon as the viewport is overfilled: every line is at
+    // least one row, so this visits at most `height` lines even when the caret
+    // has jumped halfway down the file.
+    let mut rows = 0usize;
+    for line in app.buffer.scroll..=cursor_row {
+        let here = wrap::segments(&app.buffer.lines[line], text_w).len();
+        let first = if line == app.buffer.scroll {
+            app.buffer.scroll_seg.min(here - 1)
+        } else {
+            0
+        };
+        rows += if line == cursor_row {
+            (cursor_seg + 1).saturating_sub(first)
+        } else {
+            here - first
+        };
+        if rows > height {
+            break;
+        }
+    }
+
+    if rows > height {
+        // Too tall: let the caret sit on the bottom row, and start the view
+        // whatever number of rows above it fits.
+        let mut line = cursor_row;
+        let mut seg = cursor_seg;
+        for _ in 1..height {
+            if seg > 0 {
+                seg -= 1;
+            } else if line > 0 {
+                line -= 1;
+                seg = wrap::segments(&app.buffer.lines[line], text_w).len() - 1;
+            } else {
+                break;
+            }
+        }
+        app.buffer.scroll = line;
+        app.buffer.scroll_seg = seg;
     }
 
     let mut out: Vec<Line> = Vec::new();
@@ -656,6 +692,46 @@ mod tests {
 
         // The block is centred as a whole, so its left edge is not column 0.
         assert!(index > 0, "block should sit away from the left edge");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_view_follows_the_caret_past_the_bottom_row() {
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let (mut app, dir) = app_with_file("scrolldown", &body);
+        // Ten rows of terminal: eight for the buffer, then the query and status
+        // lines.
+        let mut terminal = Terminal::new(TestBackend::new(24, 10)).unwrap();
+
+        for row in 0..20 {
+            app.buffer.row = row;
+            app.buffer.col = 0;
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+            let screen: Vec<String> = (0..8)
+                .map(|y| {
+                    (0..16)
+                        .map(|x| symbol_at(&terminal, x, y))
+                        .collect::<String>()
+                })
+                .collect();
+            assert!(
+                screen
+                    .iter()
+                    .any(|line| line.contains(&format!("line {}", row + 1))),
+                "line {} should be on screen, got {screen:?}",
+                row + 1
+            );
+            // The view stays put until the caret reaches the last row, then it
+            // scrolls one row at a time.
+            assert_eq!(
+                app.buffer.scroll,
+                row.saturating_sub(7),
+                "view top with the caret on line {}",
+                row + 1
+            );
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
